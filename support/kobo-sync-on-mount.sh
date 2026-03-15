@@ -1,10 +1,11 @@
 #!/bin/bash
 # Runs kobo sync when Kobo is mounted
-# Called by launchd when /Volumes/KOBOeReader changes (mount or unmount)
+# Called by launchd (macOS) or systemd (Linux)
+# Placeholders replaced at install time.
 
 KOBO_SYNC_DIR="{{KOBO_SYNC_DIR}}"
-KOBO_DB="/Volumes/KOBOeReader/.kobo/KoboReader.sqlite"
-LOG_FILE="$HOME/.kobo-sync/sync.log"
+KOBO_DB="{{KOBO_DB}}"
+LOG_FILE="{{LOG_FILE_PATH}}"
 
 mkdir -p "$(dirname "$LOG_FILE")"
 
@@ -38,10 +39,29 @@ else
   BUNDLE_CMD="bundle"
 fi
 
-if $BUNDLE_CMD exec rake sync:run >> "$LOG_FILE" 2>&1; then
-  osascript -e 'display notification "Reading sessions synced to BookLore" with title "Kobo Sync"' 2>/dev/null || true
+notify() {
+  local msg="$1"
+  local is_error="${2:-false}"
+  if command -v osascript &>/dev/null; then
+    if [[ "$is_error" == "true" ]]; then
+      osascript -e "display notification \"$msg\" with title \"Kobo Sync\" sound name \"Basso\"" 2>/dev/null || true
+    else
+      osascript -e "display notification \"$msg\" with title \"Kobo Sync\"" 2>/dev/null || true
+    fi
+  elif command -v notify-send &>/dev/null; then
+    if [[ "$is_error" == "true" ]]; then
+      notify-send -u critical "Kobo Sync" "$msg" 2>/dev/null || true
+    else
+      notify-send "Kobo Sync" "$msg" 2>/dev/null || true
+    fi
+  fi
+}
+
+# Pass KOBO_VOLUME to rake so resolve_kobo_volume picks up the right path
+if KOBO_VOLUME="${KOBO_DB%/.kobo/KoboReader.sqlite}" $BUNDLE_CMD exec rake sync:run >> "$LOG_FILE" 2>&1; then
+  notify "Reading sessions synced to BookLore"
   echo "$(date): Sync completed successfully" >> "$LOG_FILE"
 else
-  osascript -e 'display notification "Sync failed - check ~/.kobo-sync/sync.log" with title "Kobo Sync" sound name "Basso"' 2>/dev/null || true
+  notify "Sync failed - check $LOG_FILE" true
   echo "$(date): Sync failed" >> "$LOG_FILE"
 fi

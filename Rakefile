@@ -7,18 +7,80 @@ require "uri"
 require "time"
 require "fileutils"
 
-KOBO_VOLUME = "/Volumes/KOBOeReader"
-KOBO_DB = "#{KOBO_VOLUME}/.kobo/KoboReader.sqlite"
-STATE_DIR = File.expand_path("~/.kobo-sync")
+# Supported platforms: macOS, Linux. All OS-specific logic uses "if mac? ... elsif linux?".
+def platform
+  @platform ||= Gem::Platform.local.os
+end
+
+def mac?
+  platform == "darwin"
+end
+
+def linux?
+  platform == "linux"
+end
+
+def ensure_supported_os!
+  return if %w[darwin linux].include?(platform)
+  abort "Unsupported OS. This project supports macOS and Linux only. (Detected: #{RUBY_PLATFORM})"
+end
+
+# State directory: ~/.kobo-sync on macOS, XDG on Linux
+def state_dir
+  ensure_supported_os!
+  if mac?
+    File.expand_path("~/.kobo-sync")
+  elsif linux?
+    base = ENV["XDG_CONFIG_HOME"]
+    base = File.expand_path("~/.config") if base.nil? || base.empty?
+    File.join(base, "kobo-sync")
+  end
+end
+
+STATE_DIR = state_dir
 STATE_DB = "#{STATE_DIR}/state.db"
 
+def default_kobo_volume_candidates
+  if mac?
+    ["/Volumes/KOBOeReader"]
+  elsif linux?
+    user = ENV["USER"] || ENV["LOGNAME"] || "root"
+    ["/run/media/#{user}/KOBOeReader", "/media/#{user}/KOBOeReader"]
+  end
+end
+
+def preferred_kobo_volume
+  sdb = state_db
+  cfg = get_config(sdb, "kobo_volume")
+  sdb.close
+  cfg || ENV["KOBO_VOLUME"] || default_kobo_volume_candidates.first
+end
+
+def resolve_kobo_volume
+  vol = preferred_kobo_volume
+  return vol if vol && File.exist?("#{vol}/.kobo/KoboReader.sqlite")
+  default_kobo_volume_candidates.each do |path|
+    return path if File.exist?("#{path}/.kobo/KoboReader.sqlite")
+  end
+  nil
+end
+
+def kobo_volume
+  @kobo_volume ||= resolve_kobo_volume
+end
+
+def kobo_db
+  kobo_volume && "#{kobo_volume}/.kobo/KoboReader.sqlite"
+end
+
 def kobo_mounted?
-  File.exist?(KOBO_DB)
+  !!kobo_volume
 end
 
 def require_kobo!
   unless kobo_mounted?
-    abort "Error: Kobo not mounted. Expected database at #{KOBO_DB}"
+    candidates = default_kobo_volume_candidates.first(3).join(", ")
+    abort "Error: Kobo not mounted. Checked: #{candidates} (or set KOBO_VOLUME or run rake kobo:config_volume)"
   end
 end
 
@@ -52,7 +114,8 @@ def set_config(db, key, value)
 end
 
 def read_kobo_sync_url
-  config_file = "#{KOBO_VOLUME}/.kobo/Kobo/Kobo eReader.conf"
+  return nil unless kobo_volume
+  config_file = "#{kobo_volume}/.kobo/Kobo/Kobo eReader.conf"
   return nil unless File.exist?(config_file)
 
   content = File.read(config_file)
@@ -73,9 +136,9 @@ namespace :kobo do
   desc "Check if Kobo is mounted"
   task :check do
     if kobo_mounted?
-      puts "✓ Kobo is mounted at #{KOBO_VOLUME}"
+      puts "✓ Kobo is mounted at #{kobo_volume}"
 
-      db = SQLite3::Database.new(KOBO_DB)
+      db = SQLite3::Database.new(kobo_db)
       book_count = db.get_first_value("SELECT COUNT(*) FROM content WHERE ContentType = 6")
       puts "  Books: #{book_count}"
 
@@ -88,7 +151,7 @@ namespace :kobo do
       puts "  Already synced sessions: #{synced}"
       sdb.close
     else
-      puts "✗ Kobo not mounted at #{KOBO_VOLUME}"
+      puts "✗ Kobo not mounted. Checked: #{default_kobo_volume_candidates.first(3).join(', ')}"
       exit 1
     end
   end
@@ -97,7 +160,7 @@ namespace :kobo do
   task :install_trigger do
     require_kobo!
 
-    db = SQLite3::Database.new(KOBO_DB)
+    db = SQLite3::Database.new(kobo_db)
 
     existing = db.get_first_value(
       "SELECT name FROM sqlite_master WHERE type='trigger' AND name='PreserveAnalyticsEvents'"
@@ -126,7 +189,7 @@ namespace :kobo do
   task :remove_trigger do
     require_kobo!
 
-    db = SQLite3::Database.new(KOBO_DB)
+    db = SQLite3::Database.new(kobo_db)
 
     existing = db.get_first_value(
       "SELECT name FROM sqlite_master WHERE type='trigger' AND name='PreserveAnalyticsEvents'"
@@ -146,7 +209,7 @@ namespace :kobo do
   task :schema do
     require_kobo!
 
-    db = SQLite3::Database.new(KOBO_DB)
+    db = SQLite3::Database.new(kobo_db)
 
     puts "=== AnalyticsEvents Schema ==="
     schema = db.get_first_value("SELECT sql FROM sqlite_master WHERE type='table' AND name='AnalyticsEvents'")
@@ -175,7 +238,7 @@ namespace :kobo do
   task :triggers do
     require_kobo!
 
-    db = SQLite3::Database.new(KOBO_DB)
+    db = SQLite3::Database.new(kobo_db)
 
     triggers = db.execute("SELECT name, sql FROM sqlite_master WHERE type='trigger'")
 
@@ -192,11 +255,76 @@ namespace :kobo do
 
     db.close
   end
+
+  desc "Set Kobo mount path (Linux). On macOS the default /Volumes/KOBOeReader is used."
+  task :config_volume do
+    if mac?
+      puts "On macOS the default /Volumes/KOBOeReader is used."
+      puts "Set KOBO_VOLUME to override."
+    elsif linux?
+      sdb = state_db
+      current = get_config(sdb, "kobo_volume")
+      sdb.close
+
+      if current
+        puts "Current Kobo mount path: #{current}"
+        print "Change it? [y/N]: "
+        answer = $stdin.gets.chomp.downcase
+        unless answer == "y"
+          next
+        end
+      end
+
+      default_path = default_kobo_volume_candidates.first
+      detected = default_kobo_volume_candidates.find { |p| File.exist?("#{p}/.kobo/KoboReader.sqlite") }
+      unless detected
+        dirs = (Dir["/media/#{user}/*"] rescue []) + (Dir["/run/media/#{user}/*"] rescue [])
+        detected = dirs.find { |d| File.directory?(d) && File.exist?("#{d}/.kobo/KoboReader.sqlite") }
+      end
+
+      if detected
+        puts "Detected Kobo at: #{detected}"
+        print "Use this path? [Y/n]: "
+        answer = $stdin.gets.chomp.downcase
+        if answer.empty? || answer == "y"
+          path = detected
+        else
+          puts "Default suggestion: #{default_path}"
+          print "Enter Kobo mount path (or press Enter for default): "
+          path = $stdin.gets.chomp.strip
+          path = default_path if path.empty?
+        end
+      else
+        puts "Kobo not detected at common mount points."
+        puts "Default: #{default_path}"
+        print "Enter Kobo mount path (or press Enter for default): "
+        path = $stdin.gets.chomp.strip
+        path = default_path if path.empty?
+      end
+
+      sdb = state_db
+      set_config(sdb, "kobo_volume", path)
+      sdb.close
+      @kobo_volume = nil
+      puts "✓ Kobo mount path saved: #{path}"
+    end
+  end
+end
+
+def ensure_kobo_volume_configured_on_linux
+  return unless linux?
+  sdb = state_db
+  configured = get_config(sdb, "kobo_volume")
+  sdb.close
+  return if configured
+  Rake::Task["kobo:config_volume"].invoke
 end
 
 namespace :booklore do
   desc "Configure BookLore API connection"
   task :configure do
+    ensure_kobo_volume_configured_on_linux
+
     sdb = state_db
 
     # Try to read URL from Kobo config
@@ -256,11 +384,11 @@ namespace :sync do
   task :preview do
     require_kobo!
 
-    kobo_db = SQLite3::Database.new(KOBO_DB)
-    kobo_db.results_as_hash = true
+    kobo_db_conn = SQLite3::Database.new(kobo_db)
+    kobo_db_conn.results_as_hash = true
     sdb = state_db
 
-    events = kobo_db.execute(<<~SQL)
+    events = kobo_db_conn.execute(<<~SQL)
       SELECT Id, Type, Timestamp, Attributes, Metrics
       FROM AnalyticsEvents
       WHERE Type IN ('OpenContent', 'LeaveContent')
@@ -291,7 +419,7 @@ namespace :sync do
 
         open_attrs = JSON.parse(open_event["Attributes"])
 
-        title = kobo_db.get_first_value(
+        title = kobo_db_conn.get_first_value(
           "SELECT Title FROM content WHERE ContentID = ? AND ContentType = 6",
           volumeid
         )
@@ -328,7 +456,7 @@ namespace :sync do
       end
     end
 
-    kobo_db.close
+    kobo_db_conn.close
     sdb.close
   end
 
@@ -345,8 +473,8 @@ namespace :sync do
       abort "Error: BookLore not configured. Run: rake booklore:configure"
     end
 
-    kobo_db = SQLite3::Database.new(KOBO_DB)
-    kobo_db.results_as_hash = true
+    kobo_db_conn = SQLite3::Database.new(kobo_db)
+    kobo_db_conn.results_as_hash = true
 
     # Get JWT token
     puts "Authenticating with BookLore..."
@@ -368,7 +496,7 @@ namespace :sync do
     puts "✓ Authenticated"
 
     # Get events and pair them
-    events = kobo_db.execute(<<~SQL)
+    events = kobo_db_conn.execute(<<~SQL)
       SELECT Id, Type, Timestamp, Attributes, Metrics
       FROM AnalyticsEvents
       WHERE Type IN ('OpenContent', 'LeaveContent')
@@ -399,7 +527,7 @@ namespace :sync do
 
         open_attrs = JSON.parse(open_event["Attributes"])
 
-        title = kobo_db.get_first_value(
+        title = kobo_db_conn.get_first_value(
           "SELECT Title FROM content WHERE ContentID = ? AND ContentType = 6",
           volumeid
         )
@@ -472,7 +600,7 @@ namespace :sync do
       end
     end
 
-    kobo_db.close
+    kobo_db_conn.close
     sdb.close
     puts "Done"
   end
@@ -511,12 +639,13 @@ namespace :sync do
   end
 end
 
+SUPPORT_DIR = File.expand_path("support", __dir__)
 LAUNCHD_LABEL = "com.kobo-sync"
 LAUNCHD_PLIST = File.expand_path("~/Library/LaunchAgents/#{LAUNCHD_LABEL}.plist")
-SUPPORT_DIR = File.expand_path("support", __dir__)
+SYSTEMD_USER_DIR = File.expand_path("~/.config/systemd/user")
 
 namespace :automation do
-  desc "Install launchd agent to auto-sync when Kobo is mounted"
+  desc "Install auto-sync when Kobo is mounted (launchd on macOS, systemd on Linux)"
   task :install do
     sdb = state_db
     url = get_config(sdb, "booklore_url")
@@ -527,72 +656,152 @@ namespace :automation do
       abort "Error: Configure BookLore first: rake booklore:configure"
     end
 
-    FileUtils.mkdir_p(STATE_DIR)
-    FileUtils.mkdir_p(File.dirname(LAUNCHD_PLIST))
+    watch_path = preferred_kobo_volume
+    if linux? && (watch_path.nil? || watch_path.empty?)
+      abort "Error: Set Kobo mount path first: rake kobo:config_volume"
+    end
+    watch_path ||= "/Volumes/KOBOeReader" if mac?
+    kobo_db_path = "#{watch_path}/.kobo/KoboReader.sqlite"
 
-    # Install the sync script
+    FileUtils.mkdir_p(STATE_DIR)
+
+    # Install the sync script (shared between macOS and Linux)
     script_source = File.join(SUPPORT_DIR, "kobo-sync-on-mount.sh")
     script_dest = File.join(STATE_DIR, "kobo-sync-on-mount.sh")
-
     script_content = File.read(script_source)
     script_content.gsub!("{{KOBO_SYNC_DIR}}", __dir__)
+    script_content.gsub!("{{KOBO_DB}}", kobo_db_path)
+    script_content.gsub!("{{LOG_FILE_PATH}}", "#{STATE_DIR}/sync.log")
     File.write(script_dest, script_content)
     File.chmod(0755, script_dest)
 
-    # Install the plist
-    plist_source = File.join(SUPPORT_DIR, "com.kobo-sync.plist")
-    plist_content = File.read(plist_source)
-    plist_content.gsub!("{{SCRIPT_PATH}}", script_dest)
-    plist_content.gsub!("{{HOME}}", ENV["HOME"])
-    File.write(LAUNCHD_PLIST, plist_content)
+    if mac?
+      FileUtils.mkdir_p(File.dirname(LAUNCHD_PLIST))
 
-    # Unload if already loaded, then load
-    system("launchctl unload #{LAUNCHD_PLIST} 2>/dev/null")
-    if system("launchctl load #{LAUNCHD_PLIST}")
-      puts "✓ Automation installed"
-      puts "  Plist: #{LAUNCHD_PLIST}"
-      puts "  Script: #{script_dest}"
-      puts "  Log: #{STATE_DIR}/sync.log"
-      puts ""
-      puts "Kobo sync will now run automatically when you mount your Kobo."
-    else
-      abort "Error: Failed to load launchd agent"
+      plist_source = File.join(SUPPORT_DIR, "com.kobo-sync.plist")
+      plist_content = File.read(plist_source)
+      plist_content.gsub!("{{SCRIPT_PATH}}", script_dest)
+      plist_content.gsub!("{{HOME}}", ENV["HOME"])
+      File.write(LAUNCHD_PLIST, plist_content)
+
+      system("launchctl unload #{LAUNCHD_PLIST} 2>/dev/null")
+      if system("launchctl load #{LAUNCHD_PLIST}")
+        puts "✓ Automation installed (launchd)"
+        puts "  Plist: #{LAUNCHD_PLIST}"
+      else
+        abort "Error: Failed to load launchd agent"
+      end
+    elsif linux?
+      FileUtils.mkdir_p(SYSTEMD_USER_DIR)
+
+      # Derive systemd mount unit name from path
+      mount_unit = watch_path.chomp("/").gsub("/", "-").sub(/\A-/, "") + ".mount"
+
+      service_dest = File.join(SYSTEMD_USER_DIR, "kobo-sync.service")
+      service_content = File.read(File.join(SUPPORT_DIR, "kobo-sync.service"))
+      service_content.gsub!("{{MOUNT_UNIT}}", mount_unit)
+      service_content.gsub!("{{SCRIPT_PATH}}", script_dest)
+      service_content.gsub!("{{LOG_PATH}}", "#{STATE_DIR}/systemd.log")
+      File.write(service_dest, service_content)
+
+      # Create WantedBy symlink manually — the mount unit only exists when the device
+      # is plugged in, so `systemctl enable` would fail with "dependency on non-existent unit"
+      wants_dir = File.join(SYSTEMD_USER_DIR, "#{mount_unit}.wants")
+      FileUtils.mkdir_p(wants_dir)
+      FileUtils.ln_s(File.join("..", "kobo-sync.service"), File.join(wants_dir, "kobo-sync.service"), force: true)
+
+      system("systemctl", "--user", "daemon-reload")
+      if $?.success?
+        puts "✓ Automation installed (systemd)"
+        puts "  Service: #{service_dest}"
+        puts "  Bound to: #{mount_unit}"
+      else
+        abort "Error: Failed to reload systemd. Run: systemctl --user daemon-reload"
+      end
     end
+
+    puts "  Script: #{script_dest}"
+    puts "  Log: #{STATE_DIR}/sync.log"
+    puts ""
+    puts "Kobo sync will now run automatically when you mount your Kobo."
   end
 
-  desc "Uninstall the launchd agent"
+  desc "Uninstall automation"
   task :uninstall do
-    if File.exist?(LAUNCHD_PLIST)
-      system("launchctl unload #{LAUNCHD_PLIST} 2>/dev/null")
-      File.delete(LAUNCHD_PLIST)
-      puts "✓ Automation uninstalled"
-    else
-      puts "Automation was not installed"
+    if mac?
+      if File.exist?(LAUNCHD_PLIST)
+        system("launchctl unload #{LAUNCHD_PLIST} 2>/dev/null")
+        File.delete(LAUNCHD_PLIST)
+        puts "✓ Automation uninstalled (launchd)"
+      else
+        puts "Automation was not installed"
+      end
+    elsif linux?
+      service_path = File.join(SYSTEMD_USER_DIR, "kobo-sync.service")
+      removed = false
+
+      if File.exist?(service_path)
+        system("systemctl", "--user", "disable", "--now", "kobo-sync.service", out: File::NULL, err: File::NULL)
+        File.delete(service_path)
+        removed = true
+      end
+
+      # Remove WantedBy symlinks created during install
+      Dir[File.join(SYSTEMD_USER_DIR, "*.mount.wants")].each do |wants_dir|
+        link = File.join(wants_dir, "kobo-sync.service")
+        if File.symlink?(link)
+          File.delete(link)
+          removed = true
+        end
+        Dir.rmdir(wants_dir) if Dir.exist?(wants_dir) && Dir.empty?(wants_dir)
+      end
+
+      if removed
+        system("systemctl", "--user", "daemon-reload")
+        puts "✓ Automation uninstalled (systemd)"
+      else
+        puts "Automation was not installed"
+      end
     end
 
     script_path = File.join(STATE_DIR, "kobo-sync-on-mount.sh")
     File.delete(script_path) if File.exist?(script_path)
-    # Clean up old name if exists
     old_script = File.join(STATE_DIR, "sync-on-mount.sh")
     File.delete(old_script) if File.exist?(old_script)
   end
 
   desc "Check automation status"
   task :status do
-    if File.exist?(LAUNCHD_PLIST)
-      loaded = `launchctl list 2>/dev/null | grep #{LAUNCHD_LABEL}`.strip
-      if loaded.empty?
-        puts "Automation: installed but not loaded"
-        puts "  Run: launchctl load #{LAUNCHD_PLIST}"
+    if mac?
+      if File.exist?(LAUNCHD_PLIST)
+        loaded = `launchctl list 2>/dev/null | grep #{LAUNCHD_LABEL}`.strip
+        if loaded.empty?
+          puts "Automation: installed but not loaded"
+          puts "  Run: launchctl load #{LAUNCHD_PLIST}"
+        else
+          puts "✓ Automation: installed and running (launchd)"
+        end
+        puts "  Plist: #{LAUNCHD_PLIST}"
       else
-        puts "✓ Automation: installed and running"
+        puts "Automation: not installed"
+        puts "  Run: rake automation:install"
       end
-      puts "  Plist: #{LAUNCHD_PLIST}"
-      puts "  Log: #{STATE_DIR}/sync.log"
-    else
-      puts "Automation: not installed"
-      puts "  Run: rake automation:install"
+    elsif linux?
+      service_path = File.join(SYSTEMD_USER_DIR, "kobo-sync.service")
+      if File.exist?(service_path)
+        status = `systemctl --user is-enabled kobo-sync.service 2>/dev/null`.strip
+        if status == "enabled"
+          puts "✓ Automation: installed and enabled (systemd)"
+        else
+          puts "Automation: installed but not enabled"
+        end
+        puts "  Service: #{service_path}"
+      else
+        puts "Automation: not installed"
+        puts "  Run: rake automation:install"
+      end
     end
+    puts "  Log: #{STATE_DIR}/sync.log"
   end
 
   desc "Show automation logs"
@@ -611,7 +820,7 @@ namespace :kobo do
   task :setup do
     require_kobo!
 
-    db = SQLite3::Database.new(KOBO_DB)
+    db = SQLite3::Database.new(kobo_db)
 
     # 1. Install preservation trigger
     existing = db.get_first_value(
@@ -635,7 +844,7 @@ namespace :kobo do
     db.close
 
     # 2. Check if analytics will be gathered
-    user_db = SQLite3::Database.new(KOBO_DB)
+    user_db = SQLite3::Database.new(kobo_db)
     privacy = user_db.get_first_value("SELECT PrivacyPermissions FROM user")
     user_db.close
 

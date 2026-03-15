@@ -1,0 +1,14 @@
+[Unit]
+Description=Kobo Sync when device is mounted
+After={{MOUNT_UNIT}}
+Requires={{MOUNT_UNIT}}
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+ExecStart={{SCRIPT_PATH}}
+StandardOutput=append:{{LOG_PATH}}
+StandardError=append:{{LOG_PATH}}
+
+[Install]
+WantedBy={{MOUNT_UNIT}}

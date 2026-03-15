@@ -49,11 +49,15 @@ NOTE: Setting this doesn't prevent you from buying books from the official Kobo 
 
 1. BookLore: Grab your Kobo sync token  
   On your Booklore instance: Visit `Settings > Devices`, ensure `Enable Kobo Sync` is enabled and copy the token.
-1. Kobo: Set the api_endpoint  
-  In `.kobo/Kobo/Kobo eReader.conf`, set `api_endpoint=https://booklore-instance.org/api/kobo/<token>`.  
-  On OSX:
+1. Kobo: Set the api_endpoint
+  In `.kobo/Kobo/Kobo eReader.conf`, set `api_endpoint=https://booklore-instance.org/api/kobo/<token>`.
     ```bash
+    # macOS
     $EDITOR /Volumes/KOBOeReader/.kobo/Kobo/Kobo\ eReader.conf
+
+    # Linux (common paths)
+    $EDITOR /run/media/$USER/KOBOeReader/.kobo/Kobo/Kobo\ eReader.conf
+    $EDITOR /media/$USER/KOBOeReader/.kobo/Kobo/Kobo\ eReader.conf
     ```
 
 ### 3. Configure BookLore connection
@@ -62,7 +66,9 @@ NOTE: Setting this doesn't prevent you from buying books from the official Kobo 
 rake booklore:configure
 ```
 
-Enter your BookLore URL, username, and password. Credentials are stored in `~/.kobo-sync/state.db`.
+Enter your BookLore URL, username, and password. Credentials are stored locally in the state database.
+
+On Linux, if the Kobo mount path hasn't been configured yet, you'll be prompted to set it (or run `rake kobo:config_volume` beforehand).
 
 ### 4. Install automatic sync (recommended)
 
@@ -70,8 +76,11 @@ Enter your BookLore URL, username, and password. Credentials are stored in `~/.k
 rake automation:install
 ```
 
-This installs a launchd agent that automatically syncs when you mount your Kobo. You'll get a macOS notification when sync completes.  
-See Usage below for manual sync.
+This installs platform-specific automation that syncs when you mount your Kobo:
+- **macOS**: launchd agent watching the mount point
+- **Linux**: systemd user service bound to the mount unit (no sudo required)
+
+You'll get a desktop notification when sync completes (macOS notification or `notify-send` on Linux).
 
 ## Usage
 
@@ -95,7 +104,7 @@ rake sync:stats
 
 ## Automation
 
-The automation uses macOS launchd to watch for Kobo mount events.
+The automation watches for Kobo mount events — via launchd on macOS, or systemd mount unit binding on Linux.
 
 ```bash
 rake automation:install    # Install auto-sync on mount
@@ -111,7 +120,7 @@ When installed, the workflow is simply:
 
 ## How Idempotency Works
 
-- Local state stored in `~/.kobo-sync/state.db`
+- Local state stored in `~/.kobo-sync/state.db` (macOS) or `~/.config/kobo-sync/state.db` (Linux)
 - Tracks which Kobo event IDs have been synced
 - Re-running `sync:run` only sends new sessions
 - Use `sync:reset` to clear the sync state if needed
@@ -121,6 +130,7 @@ When installed, the workflow is simply:
 ```
 rake kobo:check            # Check if Kobo is mounted
 rake kobo:setup            # Set up Kobo for syncing (install trigger, check analytics)
+rake kobo:config_volume    # Set Kobo mount path (Linux)
 rake kobo:install_trigger  # Install trigger to preserve AnalyticsEvents data
 rake kobo:remove_trigger   # Remove the PreserveAnalyticsEvents trigger
 rake kobo:schema           # Show AnalyticsEvents table schema
@@ -134,22 +144,36 @@ rake sync:run              # Sync reading sessions to BookLore
 rake sync:stats            # Show sync statistics
 rake sync:reset            # Reset sync state (mark all sessions as not synced)
 
-rake automation:install    # Install launchd agent to auto-sync when Kobo is mounted
-rake automation:uninstall  # Uninstall the launchd agent
+rake automation:install    # Install auto-sync (launchd on macOS, systemd on Linux)
+rake automation:uninstall  # Uninstall automation
 rake automation:status     # Check automation status
 rake automation:logs       # Show automation logs
 ```
 
 ## Files
 
+### macOS
 ```
 ~/.kobo-sync/
-├── state.db              # Sync state and credentials
-├── sync.log              # Automation logs
-└── sync-on-mount.sh      # Installed sync script
+├── state.db                # Sync state and credentials
+├── sync.log                # Sync logs
+└── kobo-sync-on-mount.sh   # Installed sync script
 
 ~/Library/LaunchAgents/
-└── com.kobo-sync.plist   # launchd agent (when automation installed)
+└── com.kobo-sync.plist     # launchd agent (when automation installed)
+```
+
+### Linux
+```
+~/.config/kobo-sync/        # Or $XDG_CONFIG_HOME/kobo-sync/
+├── state.db                # Sync state and credentials
+├── sync.log                # Sync logs
+├── systemd.log             # systemd service output
+└── kobo-sync-on-mount.sh   # Installed sync script
+
+~/.config/systemd/user/
+├── kobo-sync.service                       # systemd service (when automation installed)
+└── <mount-unit>.wants/kobo-sync.service    # WantedBy symlink
 ```
 
 ## Data Flow
