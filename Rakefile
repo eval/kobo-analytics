@@ -430,7 +430,7 @@ namespace :sync do
 
     # Get JWT token
     puts "Authenticating with Grimmory..."
-    auth_uri = URI("#{url}/api/v1/auth/login")
+    auth_uri = URI.join(url, "/api/v1/auth/login")
     http = Net::HTTP.new(auth_uri.host, auth_uri.port)
     http.use_ssl = auth_uri.scheme == "https"
 
@@ -471,7 +471,7 @@ namespace :sync do
           endLocation: s[:end_location]
         }
 
-        api_uri = URI("#{url}/api/v1/reading-sessions")
+        api_uri = URI.join(url, "/api/v1/reading-sessions")
         api_http = Net::HTTP.new(api_uri.host, api_uri.port)
         api_http.use_ssl = api_uri.scheme == "https"
 
